@@ -3,6 +3,7 @@
 import json 
 import numpy as np
 import geopandas as gpd
+import pandas as pd
 
 from shapely import wkt
 from shapely.geometry import Polygon,LineString
@@ -29,6 +30,8 @@ def xbd2gdf(f_in):
 
     # coords can be in xy or in lng_lat format 
     coords = image_json['features']['lng_lat']
+    coords_xy = image_json['features']['xy']
+
     wkt_polygons = []
 
     for coord in coords:
@@ -40,10 +43,26 @@ def xbd2gdf(f_in):
         uid = coord['properties']['uid']
         wkt_polygons.append((uid, damage, coord['wkt']))
 
+    wkt_polygons_xy = []
+
+    for coord in coords_xy:
+        if 'subtype' in coord['properties']:
+            damage = coord['properties']['subtype']
+        else:
+            damage = 'no-damage'
+
+        uid = coord['properties']['uid']
+        wkt_polygons_xy.append((uid, damage, coord['wkt']))
+
     polygons = []
 
     for uid, damage, swkt in wkt_polygons:
-        polygons.append((uid, damage, wkt.loads(swkt)))
+        polygons.append((uid, damage, wkt.loads(swkt), ))
+
+    polygons_xy = []
+    
+    for uid, damage, swkt in wkt_polygons_xy:
+        polygons_xy.append((uid, damage, wkt.loads(swkt), ))
 
     # adapted from https://gis.stackexchange.com/questions/380499/calculate-azimuth-from-polygon-in-geopandas
     def get_angle(poly, mode='degrees'):
@@ -61,15 +80,24 @@ def xbd2gdf(f_in):
         else:
             a = np.arctan2(p2[1]-p1[1], p2[0]-p1[0])
 
-        return {'angle': a, 'longest_segment': longest_segment.length, 'shortest_segment': shortest_segment.length}
+        # REPLACE THIS LINE
+        return {'angle': a, 'longest_segment': longest_segment.length/2, 'shortest_segment': shortest_segment.length/2}
         
     gdf = gpd.GeoDataFrame(polygons, columns=['uid', 'damage', 'geometry'], geometry='geometry', crs='EPSG:4326')
     gdf = gdf.to_crs('EPSG:3395')
+
+    gdf_xy = pd.DataFrame(polygons_xy, columns=['uid', 'damage', 'geometry'])
+    
     gdf[['angle','major', 'minor']] = gdf.apply(lambda x: get_angle(x.geometry, mode='radians'), axis=1, result_type='expand')
 
+    # inner join to remove the polygons that are not in the xy format
+    gdf = gdf.merge(gdf_xy, on='uid', how='inner', suffixes=('', '_xy'))
+
+    gdf = gpd.GeoDataFrame(gdf, columns=['uid', 'damage', 'geometry', 'angle', 'major', 'minor', 'geometry_xy'], geometry='geometry', crs='EPSG:3395')
+    # print(gdf.head())
     return gdf
 
-def rasterize_poly(gdf, crs='EPSG:3395', px=128):
+def rasterize_poly(gdf, px=128, gsd=0.5):
     from rasterio.features import rasterize
     from rasterio.transform import from_bounds
     """
@@ -77,27 +105,25 @@ def rasterize_poly(gdf, crs='EPSG:3395', px=128):
 
     Args:
         gdf (geopandas.GeoDataFrame): The geo-dataframe containing the polygons
-        crs (str): The coordinate reference system of the polygons
+        px (int): The number of pixels in the raster
+        gsd (float): The ground sample distance of the raster (in map units) i.e. the size of the pixel in linear map units
 
     Returns:
         raster (numpy.ndarray): The rasterized polygons
     """
-    gdf = gdf.to_crs(crs)
 
     xy = gdf.geometry.centroid
-    x, y = xy.x, xy.y
-    xmin, ymin, xmax, ymax = x-px/2, y-px/2, x+px/2, y+px/2
+    x, y = xy.x.item(), xy.y.item()
+    
+    r = gsd*px/2
+    xmin, ymin, xmax, ymax = x-r, y-r, x+r, y+r
 
-    shapes = [(gdf.geometry.item(), 1)]
-    # shapes = [(poly, 1) for poly in gdf.geometry]
     transform = from_bounds(xmin, ymin, xmax, ymax, px, px)
-    raster = rasterize(
-            shapes,
-            out_shape=(px, px),
-            fill=0,
-            all_touched=True,
-            transform=transform,
-            )
+    
+    # BUG: gdf.geometry.item() does not work with pd.apply when implemented downstream (see main method) but it works when using a loop with DataFrame.iterrows()
+
+    # raster = rasterize([(gdf.geometry.item(), 1),], out_shape=(px, px), fill=0, all_touched=True, transform=transform)
+    raster = rasterize([(gdf.geometry, 1),], out_shape=(px, px), fill=0, all_touched=True, transform=transform)
     return raster, transform
 
 def draw_ellipsoid(c, M, m, a):
@@ -136,7 +162,7 @@ def poly2density(gdf, kernel, px=128, mode='centroid'):
 
     if mode == 'centroid':
         xy = gdf.geometry.centroid
-        x, y = xy.x.item(), xy.y.item()
+        x, y = xy.x, xy.y
 
         empty_grid = np.zeros((px,px))
         i = int(px/2)
@@ -176,6 +202,55 @@ def poly2density(gdf, kernel, px=128, mode='centroid'):
         
     return r, t
 
+def io_wrap(name, r, _, target='./temp_densities'):
+    """
+    Save the raster to a file
+
+    Args:
+        name (str): The name of the file
+        r (numpy.ndarray): The raster
+        target (str): The target directory
+    """
+    import matplotlib.image
+    import os
+
+    if not os.path.exists(target):
+        os.makedirs(target)
+
+    matplotlib.image.imsave(f"{target}/{name}.png", r, cmap='gray')
+
+def rgb_io_wrap(name, r, target='./temp_rgb'):
+    """
+    Save the raster to a file
+
+    Args:
+        name (str): The name of the file
+        r (numpy.ndarray): The raster
+        target (str): The target directory
+    """
+    import matplotlib.image
+    import os
+
+    if not os.path.exists(target):
+        os.makedirs(target)
+
+    matplotlib.image.imsave(f"{target}/{name}.png", r, cmap='gray')
+
+def poly2rgbClip(gdf, rgb, px=128):
+
+    name = gdf.uid
+    print(gdf.geometry_xy)
+    xy = gdf.geometry_xy.centroid
+    
+    x, y = xy.x.item(), xy.y.item()
+
+    r = px/2
+    xmin, ymin, xmax, ymax = x-r, y-r, x+r, y+r
+
+    rgb_slice = rgb[int(ymin):int(ymax), int(xmin):int(xmax), :] 
+    return name, rgb_slice
+
+
 # Kernel functions. Can be customized with different functions
 # check https://en.wikipedia.org/wiki/Kernel_(statistics)
 
@@ -210,6 +285,8 @@ def generate_kernel(r, f, limit=1):
     
 if __name__ == "__main__":
 
+    import os
+
     gk = generate_kernel(15,gaussianKernel)
     ek = generate_kernel(15,epanechnikovKernel)
     tk = generate_kernel(15,tricubeKernel)
@@ -218,46 +295,15 @@ if __name__ == "__main__":
     import geopandas as gpd
 
     f_in = './data/woolsey-fire_00000645_post_disaster.json'
+    img_in = './data/woolsey-fire_00000645_post_disaster.png'
+
     gdf = xbd2gdf(f_in)
     gdf = gdf.to_crs('EPSG:3395')
 
-    shapes =[31, 13, 2, 26, 29]
-    gdf_sub = gdf.iloc[shapes]
+    img = plt.imread(img_in)
 
-    fig, ax = plt.subplots(5,4, figsize=(13.5,16))
-    for i, (bid, shape) in enumerate(gdf_sub.iterrows()):
+    os.makedirs('./temp', exist_ok=True)
+    gdf.apply(lambda x: io_wrap(x.uid, *poly2density(x, gk, px=128, mode='poly')), axis=1)
+    gdf.apply(lambda x: rgb_io_wrap(*poly2rgbClip(x, img, px=128)), axis=1)
 
-        # print(type(shape.geometry))
-        x,y = shape.geometry.exterior.xy
-        c = shape.geometry.centroid
-        x, y = x - c.x, y - c.y
-        ax[i,0].plot(x,y)   
-        ax[i,0].set_title(f'Polygon {bid}')
-
-        ax[i,0].set_xlim(-32,32)
-        ax[i,0].set_ylim(-32,32)
-        ax[i,0].set_aspect('equal')
-
-        shape = gpd.GeoDataFrame([shape], columns=gdf.columns, geometry='geometry', crs='EPSG:3395')
-        
-
-        r, t = poly2density(shape, gk, px=128, mode='ellipsoid')
-        ax[i,1].imshow(r)
-        ax[i,1].set_title('Gaussian kernel (n=15)')
-
-        r, t = poly2density(shape, ek, px=128, mode='ellipsoid')
-        ax[i,2].imshow(r)
-        ax[i,2].set_title('Epanechnikov kernel (n=15)')
-
-        r, t = poly2density(shape, tk, px=128, mode='ellipsoid')
-        ax[i,3].imshow(r)
-        ax[i,3].set_title('Tricube kernel (n=15)')
-
-        for a in ax[i]:
-            a.set_xticks([])
-            a.set_yticks([])
-
-        # fig.tight_layout()
-    fig.subplots_adjust(left=.0, right=1.0, bottom=.0,top=0.9, wspace=0.01, hspace=0.1)
-    fig.suptitle('Density about an ellipsoid based on the minimum rotated bounding area using different kernels (|x| = |y|=32m (128px))', x=0.5, y=0.95, )
 # %%
